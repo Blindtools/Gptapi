@@ -1,10 +1,11 @@
-
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import g4f
 import base64
 from io import BytesIO
 
 app = Flask(__name__)
+CORS(app)
 
 @app.route('/')
 def home():
@@ -39,23 +40,16 @@ def chat_completions():
             return jsonify({'error': f'Error processing image data: {e}'}), 400
 
     try:
-        # Use specific providers that are more likely to work without auth
-        # Or let G4F decide but handle the common 'RetryProvider' error more gracefully
         client = g4f.Client()
-        
-        # Determine provider based on model if needed, or use a reliable one
-        provider = None
-        
-        # Mapping models to known providers if they are not in the 'auto' list or fail
+
         model_mapping = {
-            'gpt-3.5-turbo': 'gpt-4o-mini', # Redirect to a more likely available model
+            'gpt-3.5-turbo': 'gpt-4o-mini',
             'gpt-4': 'gpt-4o',
             'llama-3.1-8b': 'llama-3.1-8b-instruct',
         }
-        
+
         target_model = model_mapping.get(model, model)
 
-        # Trying a few reliable providers if auto fails
         try:
             response = client.chat.completions.create(
                 model=target_model,
@@ -63,7 +57,6 @@ def chat_completions():
                 images=g4f_images if g4f_images else None
             )
         except:
-            # Fallback to known working providers
             reliable_providers = [
                 g4f.Provider.PollinationsAI,
                 g4f.Provider.ApiAirforce
@@ -85,6 +78,7 @@ def chat_completions():
                     continue
             if not success:
                 raise Exception(f"All reliable providers failed. Last error: {last_error}")
+
         return jsonify({
             'model': model,
             'choices': [{
@@ -99,7 +93,6 @@ def chat_completions():
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
-    # Return a list of commonly supported models in G4F
     models = [
         'gpt-3.5-turbo', 'gpt-4', 'gpt-4o', 'gpt-4.1',
         'llama-3.1-8b', 'llama-3.3-70b',
@@ -114,7 +107,7 @@ def image_generations():
     if not data:
         return jsonify({'error': 'Invalid JSON payload'}), 400
 
-    model = data.get('model', 'flux') # Default image generation model
+    model = data.get('model', 'flux')
     prompt = data.get('prompt')
     response_format = data.get('response_format', 'url')
 
@@ -128,7 +121,6 @@ def image_generations():
             prompt=prompt,
             response_format=response_format
         )
-        # G4F returns a list of data objects, each with a URL or b64_json
         results = []
         for item in response.data:
             if response_format == 'url':
@@ -139,6 +131,5 @@ def image_generations():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Vercel specific entry point
 if __name__ == '__main__':
     app.run(debug=True)
