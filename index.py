@@ -12,7 +12,7 @@ CORS(app)
 # Bug fix #6: Create client once at module level, not per request
 client = g4f.Client()
 
-# Bug fix #4: Full model list with correct g4f model names
+# Full model list with correct g4f model names
 AVAILABLE_MODELS = [
     "gpt-4o",
     "gpt-4o-mini",
@@ -53,8 +53,6 @@ MODEL_MAPPING = {
 FALLBACK_PROVIDERS = [
     g4f.Provider.PollinationsAI,
     g4f.Provider.ApiAirforce,
-    g4f.Provider.Pizzagpt,
-    g4f.Provider.FreeChatgpt,
 ]
 
 
@@ -105,7 +103,6 @@ def chat_completions():
     if not messages:
         return jsonify({"error": {"message": "Messages are required", "type": "invalid_request_error"}}), 400
 
-    # Build messages list
     g4f_messages = [
         {"role": msg["role"], "content": msg["content"]}
         for msg in messages
@@ -116,7 +113,6 @@ def chat_completions():
     for img_data in images_data:
         try:
             raw = img_data[0]
-            # Handle both raw base64 and data URI format
             if "," in raw:
                 raw = raw.split(",", 1)[1]
             filename = img_data[1]
@@ -127,7 +123,7 @@ def chat_completions():
 
     target_model = MODEL_MAPPING.get(model, model)
 
-    # Bug fix #3: Only pass images kwarg if images actually exist
+    # Bug fix #3: Only pass images kwarg when images actually exist
     kwargs = {"model": target_model, "messages": g4f_messages}
     if g4f_images:
         kwargs["images"] = g4f_images
@@ -135,13 +131,13 @@ def chat_completions():
     response = None
     last_error = "Unknown error"
 
-    # Bug fix #1: Use `except Exception` not bare `except`
+    # Bug fix #1: Use except Exception, not bare except
     try:
         response = client.chat.completions.create(**kwargs)
     except Exception as e:
         last_error = str(e)
 
-    # Bug fix #2: Fallback uses target_model, not the original model string
+    # Bug fix #2: Fallback also uses target_model, not raw model string
     if response is None:
         for provider in FALLBACK_PROVIDERS:
             try:
@@ -163,8 +159,10 @@ def chat_completions():
         return jsonify({"error": {"message": f"All providers failed. Last error: {last_error}", "type": "server_error"}}), 500
 
     content = response.choices[0].message.content or ""
+    prompt_tokens = sum(len(m["content"].split()) for m in g4f_messages)
+    completion_tokens = len(content.split())
 
-    # Bug fix #5: Return full OpenAI-compatible response with id, object, created
+    # Bug fix #5: Full OpenAI-compatible response with id, object, created, usage
     return jsonify({
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -181,9 +179,9 @@ def chat_completions():
             }
         ],
         "usage": {
-            "prompt_tokens": sum(len(m["content"].split()) for m in g4f_messages),
-            "completion_tokens": len(content.split()),
-            "total_tokens": sum(len(m["content"].split()) for m in g4f_messages) + len(content.split()),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     })
 
