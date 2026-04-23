@@ -8,44 +8,44 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-REQUEST_TIMEOUT = 25  # seconds
+REQUEST_TIMEOUT = 25  # seconds per provider call
 
-# ---- Provider endpoints ----
-POLLINATIONS_URL = "https://text.pollinations.ai/openai"
-POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai/prompt/"
+# NEW unified endpoint (old text.pollinations.ai is deprecated)
+POLLINATIONS_CHAT_URL = "https://gen.pollinations.ai/v1/chat/completions"
+POLLINATIONS_IMAGE_URL = "https://gen.pollinations.ai/image/"
 
-# ---- Pollinations uses its own model name system ----
-# https://text.pollinations.ai/models — real model IDs
+# Real Pollinations model IDs (from gen.pollinations.ai/v1/models)
+# Maps our friendly names → actual Pollinations model IDs
 POLLINATIONS_MODEL_MAP = {
-    "gpt-4o":           "openai",
-    "gpt-4o-mini":      "openai-mini",
-    "gpt-4.1":          "openai",
-    "gpt-4.1-mini":     "openai-mini",
-    "gpt-4.1-nano":     "openai-mini",
+    "gpt-4o":           "openai-large",   # GPT-4o
+    "gpt-4o-mini":      "openai",         # GPT-4o-mini
+    "gpt-4.1":          "openai-large",
+    "gpt-4.1-mini":     "openai",
+    "gpt-4.1-nano":     "openai",
     "gpt-4-turbo":      "openai-large",
-    "gpt-3.5-turbo":    "openai-mini",
+    "gpt-3.5-turbo":    "openai",
     "o1-mini":          "openai-reasoning",
     "o3-mini":          "openai-reasoning",
-    "llama-3.3-70b":    "llama",
+    "llama-3.3-70b":    "llama",          # Llama 3.3 70b
     "llama-3.1-70b":    "llama",
-    "llama-3.1-8b":     "llamalight",
+    "llama-3.1-8b":     "llamalight",     # Llama 3.1 8b
     "mixtral-8x7b":     "mistral",
-    "gemini-1.5-pro":   "gemini",
-    "gemini-1.5-flash": "gemini",
+    "gemini-1.5-pro":   "gemini",         # Gemini 2.0 Flash
+    "gemini-1.5-flash": "gemini-fast",    # Gemini 2.5 Flash Lite
     "gemini-2.0-flash": "gemini",
-    "claude-3.5-sonnet":"claude-hybridspace",
-    "claude-3-opus":    "claude-hybridspace",
-    "claude-3-haiku":   "claude-hybridspace",
-    "deepseek-v3":      "deepseek",
+    "claude-3.5-sonnet":"claude",         # Claude Sonnet 4.6
+    "claude-3-opus":    "claude-large",   # Claude Opus 4.6
+    "claude-3-haiku":   "claude-fast",    # Claude Haiku 4.5
+    "deepseek-v3":      "deepseek",       # DeepSeek V3.2
     "deepseek-r1":      "deepseek-reasoner",
     "qwen-2.5-72b":     "qwen-coder",
 }
 
-# ---- ApiAirforce uses different model IDs ----
+# ApiAirforce as second fallback with correct model IDs
 AIRFORCE_MODEL_MAP = {
     "gpt-4o":           "gpt-4o",
     "gpt-4o-mini":      "gpt-4o-mini",
-    "gpt-4.1":          "gpt-4o",          # fallback
+    "gpt-4.1":          "gpt-4o",
     "gpt-4.1-mini":     "gpt-4o-mini",
     "gpt-4.1-nano":     "gpt-4o-mini",
     "gpt-4-turbo":      "gpt-4-turbo",
@@ -53,9 +53,9 @@ AIRFORCE_MODEL_MAP = {
     "o1-mini":          "o1-mini",
     "o3-mini":          "o3-mini",
     "llama-3.3-70b":    "llama-3.3-70b",
-    "llama-3.1-70b":    "llama-3.1-70b",
-    "llama-3.1-8b":     "llama-3.1-8b",
-    "mixtral-8x7b":     "mixtral-8x7b",
+    "llama-3.1-70b":    "llama-3.1-70b-instruct",
+    "llama-3.1-8b":     "llama-3.1-8b-instruct",
+    "mixtral-8x7b":     "mixtral-8x7b-instruct-v0.1",
     "gemini-1.5-pro":   "google-gemini-pro",
     "gemini-1.5-flash": "google-gemini-flash",
     "gemini-2.0-flash": "google-gemini-flash-2.0",
@@ -68,43 +68,40 @@ AIRFORCE_MODEL_MAP = {
 }
 
 AVAILABLE_MODELS = list(POLLINATIONS_MODEL_MAP.keys())
-IMAGE_MODELS = ["flux", "flux-pro", "dall-e-3"]
+IMAGE_MODELS = ["flux", "flux-pro", "gptimage", "dall-e-3"]
 
-# Error phrases — if response contains these, treat as provider failure
+# Phrases that indicate a provider returned an error as text
 ERROR_PHRASES = [
-    "does not exist",
-    "not supported",
-    "no model",
-    "invalid model",
-    "unavailable",
-    "discord.gg",
-    "api.airforce",
-    "error:",
-    "<!doctype",
-    "<html",
+    "does not exist", "not supported", "invalid model",
+    "discord.gg", "api.airforce", "<!doctype", "<html",
+    "error occurred", "rate limit", "too many requests",
 ]
 
 
 def is_valid_response(text: str) -> bool:
-    """Return False if the response looks like a provider error message."""
     if not text or len(text.strip()) < 2:
         return False
     lower = text.lower()
-    return not any(phrase in lower for phrase in ERROR_PHRASES)
+    return not any(p in lower for p in ERROR_PHRASES)
 
 
 def call_pollinations(model: str, messages: list) -> str:
     poll_model = POLLINATIONS_MODEL_MAP.get(model, "openai")
     resp = requests.post(
-        POLLINATIONS_URL,
-        json={"model": poll_model, "messages": messages, "private": True},
+        POLLINATIONS_CHAT_URL,
+        json={
+            "model": poll_model,
+            "messages": messages,
+            "private": True,
+            "seed": -1,
+        },
         timeout=REQUEST_TIMEOUT,
         headers={"Content-Type": "application/json"},
     )
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
     if not is_valid_response(content):
-        raise ValueError(f"Invalid response from Pollinations: {content[:100]}")
+        raise ValueError(f"Bad response: {content[:120]}")
     return content
 
 
@@ -119,36 +116,34 @@ def call_apiairforce(model: str, messages: list) -> str:
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
     if not is_valid_response(content):
-        raise ValueError(f"Invalid response from ApiAirforce: {content[:100]}")
+        raise ValueError(f"Bad response: {content[:120]}")
     return content
 
 
 def get_completion(model: str, messages: list):
-    """Try providers in order. Returns (content, None) or (None, error_str)."""
+    """Try Pollinations first, then ApiAirforce. Returns (content, error)."""
     errors = []
 
-    # 1. PollinationsAI
     try:
         return call_pollinations(model, messages), None
     except Exception as e:
-        errors.append(f"Pollinations: {e}")
+        errors.append(f"Pollinations({POLLINATIONS_MODEL_MAP.get(model,'?')}): {e}")
 
-    # 2. ApiAirforce
     try:
         return call_apiairforce(model, messages), None
     except Exception as e:
         errors.append(f"ApiAirforce: {e}")
 
-    return None, " | ".join(str(e) for e in errors)
+    return None, " | ".join(errors)
 
 
-# ---- Routes ----
+# ─── Routes ───────────────────────────────────────────────
 
 @app.route("/")
 def home():
     return jsonify({
         "status": "running",
-        "version": "2.1",
+        "version": "2.2",
         "message": "G4F API Wrapper is running!",
         "endpoints": [
             "GET  /v1/models",
@@ -175,12 +170,12 @@ def list_models():
 
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
-    data = request.json
-    if not data:
+    body = request.json
+    if not body:
         return jsonify({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}), 400
 
-    model = data.get("model", "gpt-4o")
-    messages = data.get("messages")
+    model = body.get("model", "gpt-4o")
+    messages = body.get("messages")
     if not messages:
         return jsonify({"error": {"message": "messages required", "type": "invalid_request_error"}}), 400
 
@@ -203,18 +198,22 @@ def chat_completions():
             "message": {"role": "assistant", "content": content},
             "finish_reason": "stop",
         }],
-        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+        "usage": {
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": pt + ct,
+        },
     })
 
 
 @app.route("/v1/images/generations", methods=["POST"])
 def image_generations():
-    data = request.json
-    if not data:
+    body = request.json
+    if not body:
         return jsonify({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}), 400
 
-    prompt = data.get("prompt")
-    model = data.get("model", "flux")
+    prompt = body.get("prompt")
+    model = body.get("model", "flux")
     if not prompt:
         return jsonify({"error": {"message": "prompt required", "type": "invalid_request_error"}}), 400
 
