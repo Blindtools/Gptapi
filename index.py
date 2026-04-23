@@ -31,13 +31,22 @@ MODEL_MAPPING = {
 }
 
 # Fastest, most reliable providers — tried in order
-PROVIDERS = [
-    g4f.Provider.PollinationsAI,
-    g4f.Provider.ApiAirforce,
-    g4f.Provider.DDG,
-    g4f.Provider.Blackbox,
-    g4f.Provider.DeepInfraChat,
+# Safely load providers - skip any that don't exist in this g4f version
+_PROVIDER_NAMES = [
+    'PollinationsAI',
+    'ApiAirforce',
+    'Blackbox',
+    'DDG',
+    'DeepInfraChat',
+    'Liaobots',
+    'You',
 ]
+PROVIDERS = []
+for _name in _PROVIDER_NAMES:
+    _p = getattr(g4f.Provider, _name, None)
+    if _p is not None:
+        PROVIDERS.append(_p)
+
 
 
 def _call_g4f(model, messages, provider=None, images=None):
