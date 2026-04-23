@@ -1,16 +1,23 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import g4f
-import base64
+import os
 import time
 import uuid
-import concurrent.futures
+import base64
+import requests
 from io import BytesIO
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-G4F_TIMEOUT = 20  # seconds max per provider attempt
+REQUEST_TIMEOUT = 25  # seconds
+
+# PollinationsAI OpenAI-compatible endpoint (free, no auth needed)
+POLLINATIONS_URL = "https://text.pollinations.ai/openai"
+POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai/prompt/"
+
+# ApiAirforce endpoint
+APIAIRFORCE_URL = "https://api.airforce/v1/chat/completions"
 
 AVAILABLE_MODELS = [
     "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
@@ -19,55 +26,89 @@ AVAILABLE_MODELS = [
     "gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash",
     "claude-3.5-sonnet", "claude-3-opus", "claude-3-haiku",
     "deepseek-v3", "deepseek-r1", "qwen-2.5-72b",
-    "flux", "flux-pro", "dall-e-3",
 ]
 
-MODEL_MAPPING = {
-    "gpt-3.5-turbo": "gpt-4o-mini",
-    "gpt-4":         "gpt-4o",
-    "llama-3.1-8b":  "llama-3.1-8b-instruct",
-    "llama-3.1-70b": "llama-3.1-70b-instruct",
-    "llama-3.3-70b": "llama-3.3-70b-instruct",
+IMAGE_MODELS = ["flux", "flux-pro", "dall-e-3"]
+
+# Map model names to what each provider supports
+POLLINATIONS_MODELS = {
+    "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+    "gpt-4-turbo", "gpt-3.5-turbo", "o1-mini", "o3-mini",
+    "claude-3.5-sonnet", "claude-3-haiku",
+    "llama-3.3-70b", "llama-3.1-8b",
+    "gemini-1.5-flash", "gemini-2.0-flash",
+    "deepseek-v3", "deepseek-r1",
+    "mistral", "qwen-2.5-72b",
 }
 
-# Fastest, most reliable providers — tried in order
-# Safely load providers - skip any that don't exist in this g4f version
-_PROVIDER_NAMES = [
-    'PollinationsAI',
-    'ApiAirforce',
-    'Blackbox',
-    'DDG',
-    'DeepInfraChat',
-    'Liaobots',
-    'You',
-]
-PROVIDERS = []
-for _name in _PROVIDER_NAMES:
-    _p = getattr(g4f.Provider, _name, None)
-    if _p is not None:
-        PROVIDERS.append(_p)
+MODEL_ALIASES = {
+    "gpt-3.5-turbo":  "gpt-4o-mini",
+    "gpt-4":          "gpt-4o",
+    "llama-3.1-8b":   "llama-3.1-8b-instruct",
+    "llama-3.1-70b":  "llama-3.1-70b-instruct",
+    "llama-3.3-70b":  "llama-3.3-70b-instruct",
+    "mixtral-8x7b":   "mistral",
+    "gemini-1.5-pro": "gemini-1.5-flash",
+    "claude-3-opus":  "claude-3.5-sonnet",
+    "claude-3-haiku": "claude-3-haiku",
+}
 
 
+def call_pollinations(model, messages, timeout=REQUEST_TIMEOUT):
+    payload = {
+        "model": model,
+        "messages": messages,
+        "private": True,
+    }
+    resp = requests.post(
+        POLLINATIONS_URL,
+        json=payload,
+        timeout=timeout,
+        headers={"Content-Type": "application/json"}
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+    return content
 
-def _call_g4f(model, messages, provider=None, images=None):
-    """Run a single g4f call — designed to be run inside a thread with timeout."""
-    client = g4f.Client()
-    kwargs = {"model": model, "messages": messages}
-    if provider:
-        kwargs["provider"] = provider
-    if images:
-        kwargs["images"] = images
-    return client.chat.completions.create(**kwargs)
+
+def call_apiairforce(model, messages, timeout=REQUEST_TIMEOUT):
+    payload = {"model": model, "messages": messages}
+    resp = requests.post(
+        APIAIRFORCE_URL,
+        json=payload,
+        timeout=timeout,
+        headers={"Content-Type": "application/json"}
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+    return content
 
 
-def run_with_timeout(fn, timeout, *args, **kwargs):
-    """Run fn(*args, **kwargs) and raise TimeoutError if it exceeds timeout seconds."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(fn, *args, **kwargs)
-        try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError(f"Provider timed out after {timeout}s")
+def get_completion(model, messages):
+    """Try providers in order, return (content, error)."""
+    target = MODEL_ALIASES.get(model, model)
+    errors = []
+
+    # Provider 1: PollinationsAI
+    try:
+        poll_model = target if target in POLLINATIONS_MODELS else "gpt-4o"
+        content = call_pollinations(poll_model, messages)
+        if content:
+            return content, None
+    except Exception as e:
+        errors.append(f"Pollinations: {e}")
+
+    # Provider 2: ApiAirforce
+    try:
+        content = call_apiairforce(target, messages)
+        if content:
+            return content, None
+    except Exception as e:
+        errors.append(f"ApiAirforce: {e}")
+
+    return None, " | ".join(errors)
 
 
 @app.route("/")
@@ -75,11 +116,12 @@ def home():
     return jsonify({
         "status": "running",
         "message": "G4F API Wrapper is running!",
+        "version": "2.0",
         "endpoints": [
             "GET  /v1/models",
             "POST /v1/chat/completions",
             "POST /v1/images/generations",
-            "GET  /health"
+            "GET  /health",
         ]
     })
 
@@ -92,8 +134,8 @@ def health():
 @app.route("/v1/models", methods=["GET"])
 def list_models():
     data = [
-        {"id": m, "object": "model", "created": 1700000000, "owned_by": "g4f"}
-        for m in AVAILABLE_MODELS
+        {"id": m, "object": "model", "created": 1700000000, "owned_by": "pollinations"}
+        for m in AVAILABLE_MODELS + IMAGE_MODELS
     ]
     return jsonify({"object": "list", "data": data})
 
@@ -102,61 +144,21 @@ def list_models():
 def chat_completions():
     data = request.json
     if not data:
-        return jsonify({"error": {"message": "Invalid JSON payload", "type": "invalid_request_error"}}), 400
+        return jsonify({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}), 400
 
     model = data.get("model", "gpt-4o")
     messages = data.get("messages")
-    images_data = data.get("images", [])
-
     if not messages:
-        return jsonify({"error": {"message": "Messages are required", "type": "invalid_request_error"}}), 400
+        return jsonify({"error": {"message": "messages required", "type": "invalid_request_error"}}), 400
 
+    # Normalise messages
     g4f_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
 
-    # Parse images safely
-    g4f_images = []
-    for img in images_data:
-        try:
-            raw = img[0]
-            if "," in raw:
-                raw = raw.split(",", 1)[1]
-            g4f_images.append([BytesIO(base64.b64decode(raw)), img[1]])
-        except Exception as e:
-            return jsonify({"error": {"message": f"Image error: {e}", "type": "invalid_request_error"}}), 400
+    content, error = get_completion(model, g4f_messages)
 
-    target_model = MODEL_MAPPING.get(model, model)
-    images_arg = g4f_images if g4f_images else None
+    if not content:
+        return jsonify({"error": {"message": error or "All providers failed", "type": "server_error"}}), 500
 
-    response = None
-    last_error = "No providers succeeded"
-
-    # 1. Try auto (let g4f pick) with timeout
-    try:
-        response = run_with_timeout(
-            _call_g4f, G4F_TIMEOUT,
-            target_model, g4f_messages, None, images_arg
-        )
-    except Exception as e:
-        last_error = str(e)
-
-    # 2. Try each fallback provider with individual timeouts
-    if not response:
-        for provider in PROVIDERS:
-            try:
-                response = run_with_timeout(
-                    _call_g4f, G4F_TIMEOUT,
-                    target_model, g4f_messages, provider, images_arg
-                )
-                if response:
-                    break
-            except Exception as e:
-                last_error = f"{provider.__name__}: {e}"
-                continue
-
-    if not response:
-        return jsonify({"error": {"message": last_error, "type": "server_error"}}), 500
-
-    content = response.choices[0].message.content or ""
     prompt_tokens = sum(len(m["content"].split()) for m in g4f_messages)
     completion_tokens = len(content.split())
 
@@ -182,33 +184,32 @@ def chat_completions():
 def image_generations():
     data = request.json
     if not data:
-        return jsonify({"error": {"message": "Invalid JSON payload", "type": "invalid_request_error"}}), 400
+        return jsonify({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}), 400
 
-    model = data.get("model", "flux")
     prompt = data.get("prompt")
-    response_format = data.get("response_format", "url")
-
+    model = data.get("model", "flux")
     if not prompt:
-        return jsonify({"error": {"message": "Prompt is required", "type": "invalid_request_error"}}), 400
-
-    def _gen():
-        client = g4f.Client()
-        return client.images.generate(model=model, prompt=prompt, response_format=response_format)
+        return jsonify({"error": {"message": "prompt required", "type": "invalid_request_error"}}), 400
 
     try:
-        response = run_with_timeout(_gen, G4F_TIMEOUT)
-        results = []
-        for item in response.data:
-            if response_format == "url":
-                results.append({"url": item.url})
-            else:
-                results.append({"b64_json": item.b64_json})
-        return jsonify({"created": int(time.time()), "data": results})
+        # PollinationsAI image API - just needs prompt in URL
+        encoded = requests.utils.quote(prompt)
+        seed = int(time.time()) % 99999
+        image_url = f"{POLLINATIONS_IMAGE_URL}{encoded}?model={model}&seed={seed}&nologo=true"
+
+        # Verify URL is reachable
+        check = requests.head(image_url, timeout=REQUEST_TIMEOUT)
+        if check.status_code == 200:
+            return jsonify({
+                "created": int(time.time()),
+                "data": [{"url": image_url}]
+            })
+        else:
+            raise Exception(f"Image API returned {check.status_code}")
     except Exception as e:
         return jsonify({"error": {"message": str(e), "type": "server_error"}}), 500
 
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
