@@ -8,41 +8,25 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-REQUEST_TIMEOUT = 25  # seconds per provider call
+REQUEST_TIMEOUT = 25
 
-# NEW unified endpoint (old text.pollinations.ai is deprecated)
-POLLINATIONS_CHAT_URL = "https://gen.pollinations.ai/v1/chat/completions"
-POLLINATIONS_IMAGE_URL = "https://gen.pollinations.ai/image/"
+# text.pollinations.ai — free, no auth needed
+# Only 'openai' and 'openai-large' work without an API key
+POLLINATIONS_URL = "https://text.pollinations.ai/openai"
 
-# Real Pollinations model IDs (from gen.pollinations.ai/v1/models)
-# Maps our friendly names → actual Pollinations model IDs
-POLLINATIONS_MODEL_MAP = {
-    "gpt-4o":           "openai-large",   # GPT-4o
-    "gpt-4o-mini":      "openai",         # GPT-4o-mini
-    "gpt-4.1":          "openai-large",
-    "gpt-4.1-mini":     "openai",
-    "gpt-4.1-nano":     "openai",
-    "gpt-4-turbo":      "openai-large",
-    "gpt-3.5-turbo":    "openai",
-    "o1-mini":          "openai-reasoning",
-    "o3-mini":          "openai-reasoning",
-    "llama-3.3-70b":    "llama",          # Llama 3.3 70b
-    "llama-3.1-70b":    "llama",
-    "llama-3.1-8b":     "llamalight",     # Llama 3.1 8b
-    "mixtral-8x7b":     "mistral",
-    "gemini-1.5-pro":   "gemini",         # Gemini 2.0 Flash
-    "gemini-1.5-flash": "gemini-fast",    # Gemini 2.5 Flash Lite
-    "gemini-2.0-flash": "gemini",
-    "claude-3.5-sonnet":"claude",         # Claude Sonnet 4.6
-    "claude-3-opus":    "claude-large",   # Claude Opus 4.6
-    "claude-3-haiku":   "claude-fast",    # Claude Haiku 4.5
-    "deepseek-v3":      "deepseek",       # DeepSeek V3.2
-    "deepseek-r1":      "deepseek-reasoner",
-    "qwen-2.5-72b":     "qwen-coder",
-}
+# Map requested model → best free Pollinations model
+# GPT-4 class → openai-large, everything else → openai
+def get_pollinations_model(model: str) -> str:
+    gpt4_class = {
+        "gpt-4o", "gpt-4.1", "gpt-4-turbo",
+        "claude-3-opus", "claude-3.5-sonnet",
+        "gemini-1.5-pro", "deepseek-r1",
+    }
+    return "openai-large" if model in gpt4_class else "openai"
 
-# ApiAirforce as second fallback with correct model IDs
-AIRFORCE_MODEL_MAP = {
+# ApiAirforce — free but rate limited; use correct model IDs
+AIRFORCE_URL = "https://api.airforce/v1/chat/completions"
+AIRFORCE_MODELS = {
     "gpt-4o":           "gpt-4o",
     "gpt-4o-mini":      "gpt-4o-mini",
     "gpt-4.1":          "gpt-4o",
@@ -67,68 +51,70 @@ AIRFORCE_MODEL_MAP = {
     "qwen-2.5-72b":     "Qwen/Qwen2.5-72B-Instruct",
 }
 
-AVAILABLE_MODELS = list(POLLINATIONS_MODEL_MAP.keys())
-IMAGE_MODELS = ["flux", "flux-pro", "gptimage", "dall-e-3"]
+AVAILABLE_MODELS = list(AIRFORCE_MODELS.keys())
+IMAGE_MODELS = ["flux", "flux-pro", "dall-e-3"]
 
-# Phrases that indicate a provider returned an error as text
 ERROR_PHRASES = [
     "does not exist", "not supported", "invalid model",
     "discord.gg", "api.airforce", "<!doctype", "<html",
-    "error occurred", "rate limit", "too many requests",
+    "too many requests",
 ]
 
-
-def is_valid_response(text: str) -> bool:
+def is_valid(text: str) -> bool:
     if not text or len(text.strip()) < 2:
         return False
-    lower = text.lower()
-    return not any(p in lower for p in ERROR_PHRASES)
+    return not any(p in text.lower() for p in ERROR_PHRASES)
 
 
 def call_pollinations(model: str, messages: list) -> str:
-    poll_model = POLLINATIONS_MODEL_MAP.get(model, "openai")
+    poll_model = get_pollinations_model(model)
     resp = requests.post(
-        POLLINATIONS_CHAT_URL,
-        json={
-            "model": poll_model,
-            "messages": messages,
-            "private": True,
-            "seed": -1,
-        },
+        POLLINATIONS_URL,
+        json={"model": poll_model, "messages": messages, "private": True},
         timeout=REQUEST_TIMEOUT,
         headers={"Content-Type": "application/json"},
     )
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
-    if not is_valid_response(content):
-        raise ValueError(f"Bad response: {content[:120]}")
+    if not is_valid(content):
+        raise ValueError(f"Bad response: {content[:100]}")
     return content
 
 
 def call_apiairforce(model: str, messages: list) -> str:
-    af_model = AIRFORCE_MODEL_MAP.get(model, model)
+    af_model = AIRFORCE_MODELS.get(model, "gpt-4o-mini")
     resp = requests.post(
-        "https://api.airforce/v1/chat/completions",
+        AIRFORCE_URL,
         json={"model": af_model, "messages": messages},
         timeout=REQUEST_TIMEOUT,
         headers={"Content-Type": "application/json"},
     )
+    if resp.status_code == 429:
+        # Wait and retry once
+        time.sleep(3)
+        resp = requests.post(
+            AIRFORCE_URL,
+            json={"model": af_model, "messages": messages},
+            timeout=REQUEST_TIMEOUT,
+            headers={"Content-Type": "application/json"},
+        )
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
-    if not is_valid_response(content):
-        raise ValueError(f"Bad response: {content[:120]}")
+    if not is_valid(content):
+        raise ValueError(f"Bad response: {content[:100]}")
     return content
 
 
 def get_completion(model: str, messages: list):
-    """Try Pollinations first, then ApiAirforce. Returns (content, error)."""
     errors = []
 
+    # 1. Try Pollinations (free, no auth, always available)
     try:
         return call_pollinations(model, messages), None
     except Exception as e:
-        errors.append(f"Pollinations({POLLINATIONS_MODEL_MAP.get(model,'?')}): {e}")
+        errors.append(f"Pollinations: {e}")
 
+    # 2. Try ApiAirforce with retry
     try:
         return call_apiairforce(model, messages), None
     except Exception as e:
@@ -143,7 +129,7 @@ def get_completion(model: str, messages: list):
 def home():
     return jsonify({
         "status": "running",
-        "version": "2.2",
+        "version": "2.3",
         "message": "G4F API Wrapper is running!",
         "endpoints": [
             "GET  /v1/models",
@@ -211,20 +197,18 @@ def image_generations():
     body = request.json
     if not body:
         return jsonify({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}), 400
-
     prompt = body.get("prompt")
     model = body.get("model", "flux")
     if not prompt:
         return jsonify({"error": {"message": "prompt required", "type": "invalid_request_error"}}), 400
-
     try:
         encoded = requests.utils.quote(prompt)
         seed = int(time.time()) % 99999
-        image_url = f"{POLLINATIONS_IMAGE_URL}{encoded}?model={model}&seed={seed}&nologo=true"
-        check = requests.head(image_url, timeout=REQUEST_TIMEOUT)
+        url = f"https://image.pollinations.ai/prompt/{encoded}?model={model}&seed={seed}&nologo=true"
+        check = requests.head(url, timeout=REQUEST_TIMEOUT)
         if check.status_code == 200:
-            return jsonify({"created": int(time.time()), "data": [{"url": image_url}]})
-        raise Exception(f"Image API returned {check.status_code}")
+            return jsonify({"created": int(time.time()), "data": [{"url": url}]})
+        raise Exception(f"Status {check.status_code}")
     except Exception as e:
         return jsonify({"error": {"message": str(e), "type": "server_error"}}), 500
 
