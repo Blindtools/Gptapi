@@ -4,42 +4,22 @@ import g4f
 import base64
 import time
 import uuid
+import concurrent.futures
 from io import BytesIO
 
 app = Flask(__name__)
 CORS(app)
 
-# Bug fix #6: Create client once at module level, not per request
-client = g4f.Client()
+G4F_TIMEOUT = 20  # seconds max per provider attempt
 
-# Full model list with correct g4f model names
 AVAILABLE_MODELS = [
-    "gpt-4o",
-    "gpt-4o-mini",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-4.1-nano",
-    "gpt-4-turbo",
-    "gpt-3.5-turbo",
-    "o1",
-    "o1-mini",
-    "o3-mini",
-    "llama-3.3-70b",
-    "llama-3.1-8b",
-    "llama-3.1-70b",
-    "mixtral-8x7b",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
-    "gemini-2.0-flash",
-    "claude-3.5-sonnet",
-    "claude-3-opus",
-    "claude-3-haiku",
-    "deepseek-v3",
-    "deepseek-r1",
-    "qwen-2.5-72b",
-    "flux",
-    "flux-pro",
-    "dall-e-3",
+    "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+    "gpt-4-turbo", "gpt-3.5-turbo", "o1-mini", "o3-mini",
+    "llama-3.3-70b", "llama-3.1-8b", "llama-3.1-70b", "mixtral-8x7b",
+    "gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash",
+    "claude-3.5-sonnet", "claude-3-opus", "claude-3-haiku",
+    "deepseek-v3", "deepseek-r1", "qwen-2.5-72b",
+    "flux", "flux-pro", "dall-e-3",
 ]
 
 MODEL_MAPPING = {
@@ -50,10 +30,35 @@ MODEL_MAPPING = {
     "llama-3.3-70b": "llama-3.3-70b-instruct",
 }
 
-FALLBACK_PROVIDERS = [
+# Fastest, most reliable providers — tried in order
+PROVIDERS = [
     g4f.Provider.PollinationsAI,
     g4f.Provider.ApiAirforce,
+    g4f.Provider.DDG,
+    g4f.Provider.Blackbox,
+    g4f.Provider.DeepInfraChat,
 ]
+
+
+def _call_g4f(model, messages, provider=None, images=None):
+    """Run a single g4f call — designed to be run inside a thread with timeout."""
+    client = g4f.Client()
+    kwargs = {"model": model, "messages": messages}
+    if provider:
+        kwargs["provider"] = provider
+    if images:
+        kwargs["images"] = images
+    return client.chat.completions.create(**kwargs)
+
+
+def run_with_timeout(fn, timeout, *args, **kwargs):
+    """Run fn(*args, **kwargs) and raise TimeoutError if it exceeds timeout seconds."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"Provider timed out after {timeout}s")
 
 
 @app.route("/")
@@ -77,15 +82,9 @@ def health():
 
 @app.route("/v1/models", methods=["GET"])
 def list_models():
-    # Bug fix #4: Return proper OpenAI-compatible format
     data = [
-        {
-            "id": model,
-            "object": "model",
-            "created": 1700000000,
-            "owned_by": "g4f",
-        }
-        for model in AVAILABLE_MODELS
+        {"id": m, "object": "model", "created": 1700000000, "owned_by": "g4f"}
+        for m in AVAILABLE_MODELS
     ]
     return jsonify({"object": "list", "data": data})
 
@@ -103,81 +102,65 @@ def chat_completions():
     if not messages:
         return jsonify({"error": {"message": "Messages are required", "type": "invalid_request_error"}}), 400
 
-    g4f_messages = [
-        {"role": msg["role"], "content": msg["content"]}
-        for msg in messages
-    ]
+    g4f_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
 
-    # Bug fix #7: Safe base64 image parsing
+    # Parse images safely
     g4f_images = []
-    for img_data in images_data:
+    for img in images_data:
         try:
-            raw = img_data[0]
+            raw = img[0]
             if "," in raw:
                 raw = raw.split(",", 1)[1]
-            filename = img_data[1]
-            image_bytes = base64.b64decode(raw)
-            g4f_images.append([BytesIO(image_bytes), filename])
+            g4f_images.append([BytesIO(base64.b64decode(raw)), img[1]])
         except Exception as e:
-            return jsonify({"error": {"message": f"Error processing image: {e}", "type": "invalid_request_error"}}), 400
+            return jsonify({"error": {"message": f"Image error: {e}", "type": "invalid_request_error"}}), 400
 
     target_model = MODEL_MAPPING.get(model, model)
-
-    # Bug fix #3: Only pass images kwarg when images actually exist
-    kwargs = {"model": target_model, "messages": g4f_messages}
-    if g4f_images:
-        kwargs["images"] = g4f_images
+    images_arg = g4f_images if g4f_images else None
 
     response = None
-    last_error = "Unknown error"
+    last_error = "No providers succeeded"
 
-    # Bug fix #1: Use except Exception, not bare except
+    # 1. Try auto (let g4f pick) with timeout
     try:
-        response = client.chat.completions.create(**kwargs)
+        response = run_with_timeout(
+            _call_g4f, G4F_TIMEOUT,
+            target_model, g4f_messages, None, images_arg
+        )
     except Exception as e:
         last_error = str(e)
 
-    # Bug fix #2: Fallback also uses target_model, not raw model string
-    if response is None:
-        for provider in FALLBACK_PROVIDERS:
+    # 2. Try each fallback provider with individual timeouts
+    if not response:
+        for provider in PROVIDERS:
             try:
-                fallback_kwargs = {
-                    "model": target_model,
-                    "messages": g4f_messages,
-                    "provider": provider,
-                }
-                if g4f_images:
-                    fallback_kwargs["images"] = g4f_images
-                response = client.chat.completions.create(**fallback_kwargs)
+                response = run_with_timeout(
+                    _call_g4f, G4F_TIMEOUT,
+                    target_model, g4f_messages, provider, images_arg
+                )
                 if response:
                     break
             except Exception as e:
-                last_error = str(e)
+                last_error = f"{provider.__name__}: {e}"
                 continue
 
-    if response is None:
-        return jsonify({"error": {"message": f"All providers failed. Last error: {last_error}", "type": "server_error"}}), 500
+    if not response:
+        return jsonify({"error": {"message": last_error, "type": "server_error"}}), 500
 
     content = response.choices[0].message.content or ""
     prompt_tokens = sum(len(m["content"].split()) for m in g4f_messages)
     completion_tokens = len(content.split())
 
-    # Bug fix #5: Full OpenAI-compatible response with id, object, created, usage
     return jsonify({
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                },
-                "finish_reason": "stop",
-            }
-        ],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -199,12 +182,12 @@ def image_generations():
     if not prompt:
         return jsonify({"error": {"message": "Prompt is required", "type": "invalid_request_error"}}), 400
 
+    def _gen():
+        client = g4f.Client()
+        return client.images.generate(model=model, prompt=prompt, response_format=response_format)
+
     try:
-        response = client.images.generate(
-            model=model,
-            prompt=prompt,
-            response_format=response_format,
-        )
+        response = run_with_timeout(_gen, G4F_TIMEOUT)
         results = []
         for item in response.data:
             if response_format == "url":
